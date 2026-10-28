@@ -95,8 +95,8 @@ export function DictationController() {
 
     const modelId = settings?.voice?.sttModel
     if (!modelId) {
-      toast('No speech model selected. Download one in Settings > Voice.', {
-        // Held keys and repeated presses replace this toast instead of stacking it.
+      // message() updates by id; plain toast() appends a history entry per held-key repeat.
+      toast.message('No speech model selected. Download one in Settings > Voice.', {
         id: 'dictation-no-model',
         action: {
           label: translate(
