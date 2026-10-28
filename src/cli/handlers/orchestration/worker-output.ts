@@ -1,6 +1,6 @@
-import type { NativeChatMessage } from '../../../shared/native-chat-types'
 import type { RuntimeTerminalRead } from '../../../shared/runtime-types'
 import type { OrchestrationWorkerReadResult } from '../../../shared/orchestration-worker-output'
+import { formatWorkerTranscriptMessage } from '../../../shared/worker-transcript-text'
 
 export type LegacyWorkerReadResult = {
   dispatchId: string
@@ -8,6 +8,7 @@ export type LegacyWorkerReadResult = {
 }
 
 export type WorkerStartReceipt = {
+  mode?: { detail: string }
   taskId: string
   dispatchId: string
   state: string
@@ -21,6 +22,10 @@ export type WorkerStartReceipt = {
 
 export function formatWorkerStart(value: WorkerStartReceipt): string {
   const lines = [`Worker ${value.dispatchId} [${value.state}] for ${value.taskId}`]
+  // Show the mode that actually ran so a fallback from the user's default is visible.
+  if (value.mode) {
+    lines.push(value.mode.detail)
+  }
   if (value.lastError) {
     lines.push(`${value.failedStage ?? 'start'}: ${value.lastError}`)
   } else if (value.warning) {
@@ -68,12 +73,11 @@ function formatWorkerReadDetails(value: OrchestrationWorkerReadResult): string {
       ? `Source: transcript (provider=${value.provider})`
       : 'Source: terminal'
   const lines = [source]
-  // A released archive read otherwise prints identically to a live one.
   if (value.status?.worker) {
     lines.push(`Worker: ${value.status.worker}`)
   }
   lines.push(`Archived: ${value.archived === true}`)
-  // Two different verdicts: status.liveness is the PTY's, the fleet projection is the agent's.
+  // PTY liveness and agent liveness are separate verdicts.
   if (value.status?.liveness) {
     lines.push(`Terminal liveness: ${value.status.liveness}`)
   }
@@ -101,22 +105,6 @@ function formatWorkerReadDetails(value: OrchestrationWorkerReadResult): string {
   return lines.join('\n')
 }
 
-function formatWorkerTranscriptMessage(message: NativeChatMessage): string {
-  const blocks = message.blocks.map((block) => {
-    if (block.type === 'text') {
-      return block.text
-    }
-    if (block.type === 'tool-call') {
-      return `[tool ${block.name}] ${safeJson(block.input)}`
-    }
-    if (block.type === 'tool-result') {
-      return `[tool result${block.isError ? ' error' : ''}] ${block.output}`
-    }
-    return block.url ? `[image] ${block.url}` : `[image omitted]`
-  })
-  return `[${message.role}] ${blocks.join('\n')}`.trimEnd()
-}
-
 export type WorkerReleaseReceipt = {
   dispatchId: string
   state: string
@@ -142,12 +130,4 @@ export function formatWorkerRelease(value: WorkerReleaseReceipt): string {
     lines.push(value.recovery)
   }
   return lines.join('\n')
-}
-
-function safeJson(value: unknown): string {
-  try {
-    return JSON.stringify(value)
-  } catch {
-    return '[unserializable input]'
-  }
 }

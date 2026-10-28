@@ -77,7 +77,10 @@ export function ActivityThreadListToolbar({
                   'auto.components.activity.ActivityPrototypePage.795cbf26e2',
                   'Filter...'
                 )}
-                className={cn('h-7 w-full pl-6 text-[11px]', query ? 'pr-6' : '')}
+                className={cn(
+                  'h-7 w-full pl-6 text-[11px] shadow-none focus-visible:ring-0',
+                  query ? 'pr-6' : ''
+                )}
               />
               {query ? (
                 <Button
@@ -108,7 +111,7 @@ export function ActivityThreadListToolbar({
                 size="sm"
                 className="h-7 w-[116px] shrink-0 px-2 text-[11px]"
                 aria-label={translate(
-                  'auto.components.activity.ActivityPrototypePage.770d458144',
+                  'auto.components.activity.ActivityPrototypePage.groupAgentActivityBy',
                   'Group agent activity by'
                 )}
               >

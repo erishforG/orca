@@ -1,7 +1,7 @@
-import { ORCHESTRATION_DELIVERY_BATCH_LIMIT } from './db'
 import type { PointerDeliveryDependencies } from './mailbox-pointer-delivery-contract'
 import {
   hasUnfilteredOrchestrationWaiter,
+  selectOrchestrationPointerBatch,
   type OrchestrationMessageWaiter
 } from './mailbox-pointer-eligibility'
 import type { OrchestrationMailboxLeaf } from './mailbox-owner'
@@ -9,6 +9,10 @@ import {
   OrchestrationMailboxPointerState,
   type OrchestrationMailboxDeliveryFlight
 } from './mailbox-pointer-state'
+import {
+  MAILBOX_POINTER_RESERVED,
+  MAILBOX_POINTER_WRITE_ATTEMPTED
+} from './db/messages/mailbox-pointer-enter-state'
 import { resumePendingOrchestrationMailboxPointer } from './mailbox-pointer-resume'
 import { stageOrchestrationMailboxPointer } from './mailbox-pointer-stage'
 
@@ -63,7 +67,9 @@ export class OrchestrationMailboxPointerDelivery<TWaiter extends OrchestrationMe
     if (!this.deps.getTerminalHandleForLeafKey(this.leafKey(leaf))) {
       return
     }
-    if (db.hasOutstandingMailboxDelivery?.(mailboxHandle)) {
+    // Gate settled-agent input at this shared commit point; refusal parks for recheck instead of dropping mail.
+    if (!this.deps.isAgentSettledForDelivery(leaf)) {
+      this.parkRedelivery(mailboxHandle, options.reservedTypes)
       return
     }
     if (leaf.ptyId) {
@@ -104,16 +110,11 @@ export class OrchestrationMailboxPointerDelivery<TWaiter extends OrchestrationMe
     ) {
       return
     }
-    // Every waiter here is type-filtered (unfiltered ones returned above), so SQL exclusion is exact.
-    const excludedTypes = new Set(options.reservedTypes)
-    for (const waiter of waiters ?? []) {
-      for (const type of waiter.typeFilter ?? []) {
-        excludedTypes.add(type)
-      }
-    }
-    const unread = db.getUndeliveredUnreadMessages(mailboxHandle, undefined, {
-      excludeTypes: [...excludedTypes],
-      limit: ORCHESTRATION_DELIVERY_BATCH_LIMIT
+    const { messages: unread, heldDeliveryId } = selectOrchestrationPointerBatch({
+      db,
+      mailboxHandle,
+      waiters,
+      reservedTypes: options.reservedTypes
     })
     if (unread.length === 0 || !leaf.writable || !leaf.ptyId) {
       return
@@ -149,6 +150,7 @@ export class OrchestrationMailboxPointerDelivery<TWaiter extends OrchestrationMe
       leaf,
       mailboxHandle,
       messages: unread,
+      heldDeliveryId,
       newestSequence,
       enterDelayMs: pointerEnterDelayMs(),
       leafKey: this.leafKey(leaf),
@@ -168,7 +170,17 @@ export class OrchestrationMailboxPointerDelivery<TWaiter extends OrchestrationMe
       clearTimeout(flight.enterTimer)
     }
     if (flight?.stagedMessageIds.length) {
-      this.deps.getDb()?.markAsUndelivered(flight.stagedMessageIds)
+      const db = this.deps.getDb()
+      if (db && flight.processIncarnation) {
+        // Release only phases that provably never sent Enter; an attempted Enter may already have landed.
+        db.releaseMailboxPointerEnter(
+          flight.stagedMessageIds,
+          { ptyId, processIncarnation: flight.processIncarnation },
+          [MAILBOX_POINTER_RESERVED, MAILBOX_POINTER_WRITE_ATTEMPTED]
+        )
+      } else {
+        db?.markAsUndelivered(flight.stagedMessageIds)
+      }
     }
     for (const mailboxHandle of releasedMailboxes) {
       this.redrive(mailboxHandle, true)

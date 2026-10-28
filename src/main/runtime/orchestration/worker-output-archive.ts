@@ -1,18 +1,21 @@
 import type { AgentType, NativeChatMessage } from '../../../shared/native-chat-types'
 import type { OrchestrationWorkerReadFallbackReason } from '../../../shared/orchestration-worker-output'
-import type { OrcaRuntimeService } from '../orca-runtime'
+import type { WorkerTerminalReleaseRuntime } from './worker-terminal-release-runtime'
 import { OrchestrationError } from './orchestration-error'
 import type {
+  WorkerTerminalArchiveKind,
   WorkerTerminalArchiveRow,
   WorkerTerminalArchiveStatus
 } from './worker-terminal-ownership'
-import {
-  MAX_WORKER_TRANSCRIPT_MESSAGE_LIMIT,
-  redactWorkerTerminalLines
-} from './worker-transcript-payload'
+import { MAX_WORKER_TRANSCRIPT_MESSAGE_LIMIT } from './worker-transcript-payload'
+import { redactWorkerTerminalLines } from './worker-terminal-redaction'
 import { readWorkerTranscript } from './worker-transcript-read'
-import { getSshFilesystemProvider } from '../../providers/ssh-filesystem-dispatch'
 import { isWslHookRelayConnectionId } from '../../../shared/wsl-hook-relay-contract'
+import { captureStructuredWorkerArchive } from '../rpc/methods/orchestration-structured-worker-lifecycle'
+import type { WorkerStructuredJournalArchive } from './structured-worker-journal-archive'
+import { structuredWorkerAgent } from '../structured-worker-authority'
+import type { StructuredWorkerIdentity } from '../structured-worker-identity'
+import { readWorkerTerminalArchive } from './worker-terminal-archive-read'
 
 // Bound the durable copy of raw terminal output; the tail end is the evidence that matters.
 const TERMINAL_ARCHIVE_MAX_CHARS = 262_144
@@ -44,6 +47,11 @@ export type WorkerOutputArchiveCapture =
       content: WorkerTranscriptSnapshotArchive
       status: 'captured'
     }
+  | {
+      kind: 'structured_journal'
+      content: WorkerStructuredJournalArchive
+      status: 'captured' | 'empty'
+    }
   | { kind: 'terminal_tail'; content: WorkerTerminalTailArchive; status: 'captured' | 'empty' }
 
 export function summarizeWorkerOutputArchive(archive: WorkerTerminalArchiveRow): {
@@ -52,6 +60,11 @@ export function summarizeWorkerOutputArchive(archive: WorkerTerminalArchiveRow):
 } {
   if (archive.kind === 'transcript_pin') {
     return { source: 'transcript', status: 'captured' }
+  }
+  if (archive.kind === 'structured_journal') {
+    // Report journals as transcript output to preserve the existing paired-client source union.
+    const journal = JSON.parse(archive.content) as WorkerStructuredJournalArchive
+    return { source: 'transcript', status: journal.messages.length > 0 ? 'captured' : 'empty' }
   }
   const content = JSON.parse(archive.content) as WorkerTerminalTailArchive
   const empty =
@@ -62,25 +75,34 @@ export function summarizeWorkerOutputArchive(archive: WorkerTerminalArchiveRow):
   }
 }
 
-// Freezes an inspectable output source before the live PTY is closed. Prefers the exact
-// hook-reported provider transcript; falls back to bounded redacted terminal output. Throws
-// typed archive_failed so release retains the live terminal when no evidence can be preserved.
+// Archive exact provider transcript or redacted terminal tail before close; typed archive_failed retains live output.
 export async function captureWorkerOutputArchive(args: {
-  runtime: OrcaRuntimeService
+  runtime: WorkerTerminalReleaseRuntime
   dispatchId: string
   terminalHandle: string
   attachedAtMs: number
+  /** Present when the worker IS a structured session; its journal is the only output it has. */
+  structuredWorker?: StructuredWorkerIdentity | null
 }): Promise<WorkerOutputArchiveCapture> {
+  if (args.structuredWorker) {
+    const content = await captureStructuredWorkerArchive(
+      args.structuredWorker,
+      structuredWorkerAgent(args.structuredWorker)
+    )
+    return {
+      kind: 'structured_journal',
+      status: content.messages.length > 0 ? 'captured' : 'empty',
+      content
+    }
+  }
   const session = args.runtime.getExactWorkerProviderSession(args.terminalHandle, args.attachedAtMs)
   let transcriptFallbackReason: OrchestrationWorkerReadFallbackReason = 'session_not_reported'
   if (session) {
     transcriptFallbackReason = 'transcript_unreadable'
     const isWslSession = isWslHookRelayConnectionId(session.connectionId)
-    const remoteConnectionId = session.connectionId && !isWslSession ? session.connectionId : null
-    const remoteFilesystemProvider = remoteConnectionId
-      ? getSshFilesystemProvider(remoteConnectionId)
-      : undefined
-    if ((isWslSession && !session.wslDistro) || (remoteConnectionId && !remoteFilesystemProvider)) {
+    // No SSH filesystem provider is installed, so remote transcripts are unreachable.
+    const isSshSession = Boolean(session.connectionId) && !isWslSession
+    if ((isWslSession && !session.wslDistro) || isSshSession) {
       transcriptFallbackReason = 'remote_capability_unavailable'
     } else {
       const snapshot = await readWorkerTranscript({
@@ -88,8 +110,7 @@ export async function captureWorkerOutputArchive(args: {
         sessionId: session.providerSession.id,
         transcriptPath: session.providerSession.transcriptPath,
         wslDistro: session.wslDistro,
-        limit: MAX_WORKER_TRANSCRIPT_MESSAGE_LIMIT,
-        filesystemProvider: remoteFilesystemProvider
+        limit: MAX_WORKER_TRANSCRIPT_MESSAGE_LIMIT
       }).catch(() => null)
       if (snapshot?.ok && snapshot.messages.length > 0) {
         return {
@@ -116,7 +137,7 @@ export async function captureWorkerOutputArchive(args: {
   }
   let terminal
   try {
-    terminal = await args.runtime.readTerminal(args.terminalHandle, {})
+    terminal = await readWorkerTerminalArchive(args.runtime, args.terminalHandle)
   } catch (error) {
     throw new OrchestrationError(
       'archive_failed',
@@ -130,8 +151,7 @@ export async function captureWorkerOutputArchive(args: {
   const bounded = boundArchiveLines(redacted.lines)
   const draft = terminal.draft ? bounded.lines.at(-1) : undefined
   const lines = terminal.draft ? bounded.lines.slice(0, -1) : bounded.lines
-  // Why: an exited PTY zeroes its tail immediately, so an empty capture is a distinct receipt,
-  // not silent success — worker-read must be able to say why nothing is there.
+  // An exited PTY clears its tail; report empty evidence explicitly to worker-read.
   const empty = bounded.lines.every((line) => line.trim() === '')
   return {
     kind: 'terminal_tail',
@@ -144,9 +164,10 @@ export async function captureWorkerOutputArchive(args: {
       warnings: empty
         ? [
             ...redacted.warnings,
+            ...terminal.warnings,
             'The live terminal buffer was empty at release; structured transcript output was unavailable.'
           ]
-        : redacted.warnings,
+        : [...redacted.warnings, ...terminal.warnings],
       fallbackReason: transcriptFallbackReason,
       clipping: [
         'terminal_fallback',
@@ -160,12 +181,14 @@ export function boundArchiveLines(lines: string[]): { lines: string[]; truncated
   let total = 0
   for (const line of lines) {
     total += line.length + 1
+    if (total > TERMINAL_ARCHIVE_MAX_CHARS) {
+      break
+    }
   }
   if (total <= TERMINAL_ARCHIVE_MAX_CHARS) {
     return { lines, truncated: false }
   }
-  // Collected newest-first and reversed once: unshift per line is O(n^2) and the
-  // char budget admits ~260k blank lines.
+  // Collect newest-first and reverse once; per-line unshift is quadratic for ~260k blank lines.
   const keptReversed: string[] = []
   let budget = TERMINAL_ARCHIVE_MAX_CHARS
   for (let index = lines.length - 1; index >= 0; index -= 1) {
@@ -182,3 +205,10 @@ export function boundArchiveLines(lines: string[]): { lines: string[]; truncated
   keptReversed.reverse()
   return { lines: keptReversed, truncated: true }
 }
+
+/** Errors at compile time if a capture kind is ever added that the durable row cannot store. */
+type AssertAssignable<TValue extends TBound, TBound> = TValue
+export type WorkerOutputArchiveCaptureKind = AssertAssignable<
+  WorkerOutputArchiveCapture['kind'],
+  WorkerTerminalArchiveKind
+>

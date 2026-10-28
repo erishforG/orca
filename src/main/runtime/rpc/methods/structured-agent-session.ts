@@ -1,30 +1,43 @@
-// `agentSession.*` — the structured session RPC surface.
-//
-// Every method here is gated on the client advertising
-// `agent-session.structured.v1`. A client that does not is told the surface does
-// not exist rather than receiving the journal or mutation surface. Session-tab
-// inventory may expose only a metadata placeholder for an incapable mobile client.
+import {
+  clientReadsCurrentRequests,
+  STRUCTURED_AGENT_SESSION_CURRENT_REQUESTS_METHODS
+} from './structured-agent-session-current-requests'
+import { clientSupportsSnapshotCatchUp } from './structured-agent-session-history-capability'
+// Require structured.v1 from remote callers before exposing journals/mutations; legacy mobile may receive session-tab metadata placeholders.
 
 import {
-  agentSessionFingerprintConflict,
-  computeAgentSessionPayloadFingerprint
-} from '../../../../shared/agent-session-mutation-envelope'
-import type { z } from 'zod'
-import { defineMethod, defineStreamingMethod, type RpcAnyMethod, type RpcContext } from '../core'
+  projectBackgroundTaskEvent,
+  projectBackgroundTaskHistory
+} from './structured-agent-session-background-task-capability'
+import {
+  projectQueuedImageCardPublication,
+  projectQueuedImageCardHistory
+} from './structured-agent-session-queued-image-capability'
+import {
+  projectTurnItemEvent,
+  projectTurnItemHistory
+} from './structured-agent-session-turn-item-capability'
+import { defineMethod, defineStreamingMethod } from '../core'
 import {
   ensureStructuredHostInstalled as ensureHostInstalled,
+  requireInstalledStructuredHost as requireInstalledHost,
   requireStructuredCapability,
-  requireStructuredHost as requireHost,
-  structuredCallerFor as callerFor,
-  supportsStructuredSessions
+  requireStructuredCleanupHost,
+  requireStructuredCreateSupportAdmission,
+  requireStructuredSessionHost as requireSessionHost,
+  structuredCallerFor as callerFor
 } from './structured-agent-session-gate'
 import {
-  attachFingerprintFields,
-  type AgentSessionAttachParams
-} from '../../../native-chat/agent-session-wire/structured-agent-session-attach'
+  handleStructuredAgentSessionCreate,
+  attachClientSuppliedLocation
+} from './structured-agent-session-create-handler'
 import { STRUCTURED_AGENT_SESSION_HOLD_METHODS } from './structured-agent-session-hold'
+import { STRUCTURED_AGENT_SESSION_PROMPT_RESPONSE_METHODS } from './structured-agent-session-prompt-response'
 import { STRUCTURED_AGENT_SESSION_REVEAL_METHODS } from './structured-agent-session-reveal'
-import { resolveUncommittedStructuredCreate } from './structured-agent-session-precommit-refusal'
+import { STRUCTURED_AGENT_SESSION_REGENERATE_NAME_METHODS } from './structured-agent-session-regenerate-name'
+import { STRUCTURED_AGENT_SESSION_RENAME_METHODS } from './structured-agent-session-rename'
+import { STRUCTURED_AGENT_SESSION_QUEUED_METHODS } from './structured-agent-session-queued-methods'
+import { STRUCTURED_AGENT_SESSION_RESTART_RESUME_METHODS } from './structured-agent-session-restart-resume'
 import {
   bindStructuredAgentSessionStream,
   STRUCTURED_AGENT_SESSION_STATUS_METHODS
@@ -33,248 +46,243 @@ import {
   structuredAgentSessionSubscriptionBase as subscriptionBaseFor,
   structuredAgentSessionSubscriptionId as subscriptionIdFor
 } from './structured-agent-session-subscription-id'
+import { STRUCTURED_AGENT_SESSION_TURN_COMPLETION_METHODS } from './structured-agent-session-turn-completion-stream'
+import { STRUCTURED_AGENT_SESSION_THREAD_GOAL_METHODS } from './structured-agent-session-thread-goal'
+import { STRUCTURED_AGENT_SESSION_CONVERSATION_OUTLINE_METHODS } from './structured-agent-session-conversation-outline'
+import { STRUCTURED_AGENT_SESSION_ITEM_METHODS } from './structured-agent-session-item'
+import { STRUCTURED_AGENT_SESSION_OPTIONS_READ_METHODS } from './structured-agent-session-options-read'
 import {
   AttachParams,
   CancelParams,
+  ConversationCommandParams,
   CreateParams,
   CreateSupportParams,
   HistoryParams,
-  HandoffParams,
-  HandoffStatusParams,
   OptionsParams,
-  RespondParams,
+  RewindParams,
   SendParams,
-  SetOptionParams,
+  SleepWorkspaceParams,
   SubscribeParams,
   UnsubscribeParams
 } from './structured-agent-session-schemas'
+import { sendStructuredAgentSessionForClient } from './structured-agent-session-send-compatibility'
+import { getStructuredAgentSessionHost } from '../../../native-chat/agent-session-wire/structured-agent-session-registry'
+import { LOCAL_EXECUTION_HOST_ID } from '../../../../shared/execution-host'
+import { ORCA_LAYOUT_OWNER_IS_MAIN } from '../../../../shared/layout-owner-switch'
+import {
+  noteStructuredAgentSessionClose,
+  refusingStructuredAgentSessionCreatesClosedFirst
+} from './structured-agent-session-close-before-create'
 
-/**
- * The attach-shaped entries take the location from the client instead of resolving it from a
- * worktree, so they never reach the worktree-resolving create-support check. Ask the executing
- * host the same question directly: the answer includes host-measured facts the client cannot see
- * or forge, such as whether this machine can read a provider child's process start time.
- */
-async function resolveClientSuppliedAttach(params: z.infer<typeof AttachParams>, ctx: RpcContext) {
-  await ensureHostInstalled(ctx)
-  const host = requireHost(ctx)
-  if (!host.supportsCreate(params.location, params.agent)) {
-    throw new Error('structured_agent_session_unsupported')
-  }
-  const { agent: _attachAgent, provider: _attachProvider, ...attachWithoutAgent } = params
-  const attachParams = {
-    ...attachWithoutAgent,
-    provider: params.provider as 'claude' | 'codex',
-    agent: params.agent as 'claude' | 'codex'
-  } as AgentSessionAttachParams
-  return { host, attachParams }
-}
-
-async function attachClientSuppliedLocation(
-  params: z.infer<typeof AttachParams>,
-  ctx: RpcContext
-): Promise<unknown> {
-  const { host, attachParams } = await resolveClientSuppliedAttach(params, ctx)
-  return host.attach(callerFor(ctx), attachParams)
-}
-
-export const STRUCTURED_AGENT_SESSION_METHODS: RpcAnyMethod[] = [
+export const STRUCTURED_AGENT_SESSION_METHODS = [
+  defineMethod({
+    name: 'agentSession.rewind',
+    permission: 'workspace',
+    params: RewindParams,
+    handler: async (params, ctx) => {
+      requireStructuredCapability(ctx)
+      await ensureHostInstalled(ctx)
+      return requireSessionHost(ctx, params.envelope.sessionId).rewind(callerFor(ctx), params)
+    }
+  }),
+  defineMethod({
+    name: 'agentSession.conversationCommand',
+    permission: 'workspace',
+    params: ConversationCommandParams,
+    handler: async (params, ctx) => {
+      requireStructuredCapability(ctx)
+      await ensureHostInstalled(ctx)
+      const host = requireSessionHost(ctx, params.envelope.sessionId)
+      await host.revealSession(params.envelope.sessionId)
+      return host.conversationCommand(callerFor(ctx), { ...params, userSend: true })
+    }
+  }),
   defineMethod({
     name: 'agentSession.createSupport',
+    permission: 'workspace',
     params: CreateSupportParams,
     handler: async (params, ctx) => {
-      if (!supportsStructuredSessions(ctx)) {
-        throw new Error('structured_agent_session_unsupported')
-      }
-      return ctx.runtime.getStructuredAgentSessionCreateSupport(params.worktree, params.agent)
+      requireStructuredCreateSupportAdmission(ctx, params.agent)
+      const support = await ctx.runtime.getStructuredAgentSessionCreateSupport(
+        params.worktree,
+        params.agent
+      )
+      // Optional: older clients ignore it, and a client seeds its picker with what create will use.
+      const seedOptions = support.supported
+        ? ctx.runtime.structuredAgentSessionLaunchSeedOptions(params.agent)
+        : undefined
+      return seedOptions ? { ...support, seedOptions } : support
     }
   }),
   defineMethod({
     name: 'agentSession.create',
+    permission: 'workspace',
     params: CreateParams,
-    handler: async (params, ctx) => {
-      requireStructuredCapability(ctx)
-      if (params.envelope.expectedRuntimeFence !== null) {
-        throw new Error('agent_session_operation_invalid')
-      }
-      // Everything up to `attach` is pre-commit, and answers with a refusal rather than a throw so
-      // a client can tell "nothing was created" from "the outcome is unknown".
-      const prepared = await resolveUncommittedStructuredCreate(async () => {
-        if ('worktree' in params) {
-          const intentFingerprint = computeAgentSessionPayloadFingerprint({
-            method: 'agentSession.create',
-            sessionId: params.envelope.sessionId,
-            fields: { worktree: params.worktree, agent: params.agent }
-          })
-          const conflict = agentSessionFingerprintConflict(params.envelope, intentFingerprint)
-          if (conflict) {
-            return { refusal: conflict }
-          }
-          const resolved = await ctx.runtime.resolveStructuredAgentSessionCreateIntent(params)
-          const hostFingerprint = computeAgentSessionPayloadFingerprint({
-            method: 'agentSession.attach',
-            sessionId: params.envelope.sessionId,
-            fields: attachFingerprintFields({ ...resolved, envelope: params.envelope })
-          })
-          await ensureHostInstalled(ctx)
-          const { agent: _resolvedAgent, provider: _resolvedProvider, ...resolvedAttach } = resolved
-          const attachParams: AgentSessionAttachParams = {
-            ...resolvedAttach,
-            provider: resolved.provider as 'claude' | 'codex',
-            agent: resolved.agent as 'claude' | 'codex',
-            envelope: { ...params.envelope, payloadFingerprint: hostFingerprint }
-          }
-          return {
-            host: requireHost(ctx),
-            attachParams,
-            tab: {
-              workspaceId: resolved.location.workspaceId,
-              agent: resolved.agent as 'claude' | 'codex'
-            }
-          }
-        }
-        const { host, attachParams } = await resolveClientSuppliedAttach(params, ctx)
-        return { host, attachParams, tab: null }
-      })
-      if ('refusal' in prepared) {
-        return { ok: false, refusal: prepared.refusal }
-      }
-      const result = await prepared.host.attach(callerFor(ctx), prepared.attachParams)
-      if (result.ok && prepared.tab) {
-        try {
-          await ctx.runtime.publishStructuredAgentSessionTab({
-            workspaceId: prepared.tab.workspaceId,
-            sessionId: result.value.sessionId,
-            agent: prepared.tab.agent,
-            activate: true
-          })
-        } catch (error) {
-          console.warn('[agent-session] create committed before tab publication failed', error)
-          return {
-            ok: false,
-            refusal: {
-              code: 'agent_session_operation_unknown',
-              message: 'The chat may have been created, but its tab could not be confirmed.'
-            }
-          }
-        }
-      }
-      return result
-    }
+    handler: ORCA_LAYOUT_OWNER_IS_MAIN
+      ? refusingStructuredAgentSessionCreatesClosedFirst(handleStructuredAgentSessionCreate)
+      : handleStructuredAgentSessionCreate
   }),
   defineMethod({
     name: 'agentSession.ensure',
+    permission: 'workspace',
     params: AttachParams,
     handler: async (params, ctx) => attachClientSuppliedLocation(params, ctx)
   }),
   defineMethod({
     name: 'agentSession.send',
+    permission: 'workspace',
     params: SendParams,
-    handler: async (params, ctx) => requireHost(ctx).send(callerFor(ctx), params)
+    handler: sendStructuredAgentSessionForClient
   }),
   defineMethod({
     name: 'agentSession.cancel',
+    permission: 'workspace',
     params: CancelParams,
-    handler: async (params, ctx) => requireHost(ctx).cancel(callerFor(ctx), params)
+    handler: async (params, ctx) => requireStructuredCleanupHost(ctx).cancel(callerFor(ctx), params)
   }),
+  ...STRUCTURED_AGENT_SESSION_QUEUED_METHODS,
   defineMethod({
-    // Releasing a chat view, not ending a conversation: the record and journal stay on disk so the
-    // same session can be attached again. Only the provider child and the in-memory entry go.
+    // Close only provider/in-memory state, preserving record/journal for future attachment.
     name: 'agentSession.close',
+    permission: 'workspace',
     params: OptionsParams,
     handler: async (params, ctx) => {
-      const host = requireHost(ctx)
+      requireStructuredCapability(ctx)
+      // Record close before requiring host so even failed closes fence racing creates.
+      if (ORCA_LAYOUT_OWNER_IS_MAIN) {
+        noteStructuredAgentSessionClose(
+          params.sessionId,
+          (getStructuredAgentSessionHost()?.deps.store.getConversation(params.sessionId) ??
+            null) !== null
+        )
+      }
+      const host = requireStructuredCleanupHost(ctx)
       // Terminal-disposal closes use this RPC without the session-tabs retirement RPC.
       if (typeof host.setSessionTabVisibility === 'function') {
         await host.setSessionTabVisibility(params.sessionId, false)
       }
-      await host.close(params.sessionId)
+      // Clients call this only when the user closes this chat's tab or cancels its launch.
+      await host.close(params.sessionId, 'user-close')
       return { ok: true as const }
     }
   }),
   defineMethod({
-    name: 'agentSession.respondToApproval',
-    params: RespondParams,
-    handler: async (params, ctx) =>
-      requireHost(ctx).respondToPrompt(callerFor(ctx), { ...params, kind: 'approval' })
+    name: 'agentSession.sleepWorkspace',
+    permission: 'workspace',
+    params: SleepWorkspaceParams,
+    handler: async (params, ctx) => {
+      requireStructuredCapability(ctx)
+      if (params.markAsleep) {
+        return (await requireInstalledHost(ctx)).sleepWorkspace(params.workspaceId, true)
+      }
+      const installed = getStructuredAgentSessionHost()
+      if (installed) {
+        return installed.sleepWorkspace(params.workspaceId, params.markAsleep)
+      }
+      let store: Awaited<ReturnType<typeof ctx.runtime.openAgentSessionRecordStore>>
+      try {
+        store = await ctx.runtime.openAgentSessionRecordStore()
+      } catch (error) {
+        const appeared = getStructuredAgentSessionHost()
+        if (appeared) {
+          return appeared.sleepWorkspace(params.workspaceId, params.markAsleep)
+        }
+        console.warn('[agent-session] workspace sleep record inventory unavailable', error)
+        return { stoppedSessionIds: [], failures: [{ reason: 'inventory-unavailable' }] }
+      }
+      const appeared = getStructuredAgentSessionHost()
+      if (appeared) {
+        return appeared.sleepWorkspace(params.workspaceId, params.markAsleep)
+      }
+      try {
+        const records = store
+          .listConversations()
+          .filter(
+            (record) =>
+              record.location.workspaceId === params.workspaceId &&
+              record.location.executionHostId === LOCAL_EXECUTION_HOST_ID
+          )
+        const stoppedSessionIds = records
+          .filter((record) => record.neverStarted)
+          .map((record) => record.sessionId)
+        const failures = records
+          .filter((record) => !record.neverStarted)
+          .map((record) => ({ sessionId: record.sessionId, reason: 'stop-unverifiable' as const }))
+        return failures.length > 0 ? { stoppedSessionIds, failures } : { stoppedSessionIds }
+      } catch (error) {
+        console.warn('[agent-session] workspace sleep record inventory failed', error)
+        return { stoppedSessionIds: [], failures: [{ reason: 'inventory-unavailable' }] }
+      }
+    }
   }),
-  defineMethod({
-    name: 'agentSession.respondToQuestion',
-    params: RespondParams,
-    handler: async (params, ctx) =>
-      requireHost(ctx).respondToPrompt(callerFor(ctx), { ...params, kind: 'question' })
-  }),
-  defineMethod({
-    name: 'agentSession.setOption',
-    params: SetOptionParams,
-    handler: async (params, ctx) => requireHost(ctx).setOption(callerFor(ctx), params)
-  }),
-  defineMethod({
-    name: 'agentSession.requestHandoff',
-    params: HandoffParams,
-    handler: async (params, ctx) => requireHost(ctx).requestHandoff(callerFor(ctx), params)
-  }),
-  defineMethod({
-    name: 'agentSession.handoffStatus',
-    params: HandoffStatusParams,
-    handler: async (params, ctx) => requireHost(ctx).handoffStatus(params.sessionId)
-  }),
-  defineMethod({
-    name: 'agentSession.options',
-    params: OptionsParams,
-    handler: async (params, ctx) => requireHost(ctx).readOptions(params.sessionId)
-  }),
+  ...STRUCTURED_AGENT_SESSION_PROMPT_RESPONSE_METHODS,
   defineMethod({
     name: 'agentSession.history',
+    permission: 'workspace',
     params: HistoryParams,
-    handler: async (params, ctx) => requireHost(ctx).history(params)
+    handler: async (params, ctx) => {
+      const host = await requireInstalledHost(ctx, params.sessionId)
+      return projectTurnItemHistory(
+        projectQueuedImageCardHistory(
+          projectBackgroundTaskHistory(
+            await host.history(
+              params,
+              undefined,
+              clientSupportsSnapshotCatchUp(ctx) && clientReadsCurrentRequests(ctx)
+            ),
+            ctx
+          ),
+          ctx
+        ),
+        ctx,
+        host.sessionAgent(params.sessionId)
+      )
+    }
   }),
   defineStreamingMethod({
     name: 'agentSession.subscribe',
+    permission: 'workspace',
     params: SubscribeParams,
     handler: async (params, ctx, emit) => {
-      const host = requireHost(ctx)
+      const host = await requireInstalledHost(ctx, params.sessionId)
       const subscriptionId = subscriptionIdFor(ctx, params.sessionId)
-      // A live stream is a surface too: it keeps a session from being evicted while it is read and
-      // releases that retention when the transport dies without a word.
-      //
-      // Retain-only: reading history must never be what starts a provider process. Current clients
-      // explicitly hold every open surface before subscribing.
-      const streamHolder = `subscription:${subscriptionId}`
+      // A stream reads; it never keeps an agent alive or starts one.
       let dispose = (): void => {}
-      const stream = bindStructuredAgentSessionStream(ctx, subscriptionId, () => {
-        dispose()
-        host.release(params.sessionId, streamHolder)
-      })
+      const stream = bindStructuredAgentSessionStream(ctx, subscriptionId, () => dispose())
       if (stream.isClosed()) {
         return
       }
-      // The host emits the opening snapshot (or the missed batch) synchronously
-      // inside open(), so nothing between here and there can interleave.
-      dispose = host.subscribe({
+      // Resolve after opening snapshot/missed batch; a racing close disposes the bound stream.
+      dispose = await host.subscribe({
+        readsCurrentRequests: clientReadsCurrentRequests(ctx),
         id: subscriptionId,
         sessionId: params.sessionId,
-        emit,
-        ...(params.cursor ? { cursor: params.cursor } : {})
+        projectQueuePublication: (publication) =>
+          projectQueuedImageCardPublication(publication, ctx),
+        emit: (event) =>
+          emit(
+            projectTurnItemEvent(
+              projectBackgroundTaskEvent(event, ctx),
+              ctx,
+              host.sessionAgent(params.sessionId)
+            )
+          ),
+        ...(params.cursor ? { cursor: params.cursor } : {}),
+        snapshotCatchUp: clientSupportsSnapshotCatchUp(ctx),
+        // Every phone's app, whatever its version, ends a stream over a frame its bridge cannot carry.
+        ...(ctx.clientKind === 'mobile' ? { boundedFrames: true } : {})
       })
       if (stream.isClosed()) {
         dispose()
-      } else {
-        // Fire-and-forget, but never unhandled: a resume that refuses leaves the stream holding a
-        // readable session, which is exactly what the client sees anyway.
-        void host
-          .hold(params.sessionId, streamHolder, { resume: false })
-          .catch((error: unknown) =>
-            console.warn('[agent-session] stream hold failed', params.sessionId, error)
-          )
       }
     }
   }),
   defineMethod({
     name: 'agentSession.unsubscribe',
+    permission: 'workspace',
     params: UnsubscribeParams,
     handler: async (params, ctx) => {
-      requireHost(ctx)
+      requireStructuredCleanupHost(ctx)
       const base = subscriptionBaseFor(ctx, params.sessionId)
       if (params.subscriptionId) {
         ctx.runtime.cleanupSubscription(`${base}:${params.subscriptionId}`)
@@ -287,5 +295,14 @@ export const STRUCTURED_AGENT_SESSION_METHODS: RpcAnyMethod[] = [
   }),
   ...STRUCTURED_AGENT_SESSION_HOLD_METHODS,
   ...STRUCTURED_AGENT_SESSION_REVEAL_METHODS,
-  ...STRUCTURED_AGENT_SESSION_STATUS_METHODS
+  ...STRUCTURED_AGENT_SESSION_REGENERATE_NAME_METHODS,
+  ...STRUCTURED_AGENT_SESSION_RENAME_METHODS,
+  ...STRUCTURED_AGENT_SESSION_RESTART_RESUME_METHODS,
+  ...STRUCTURED_AGENT_SESSION_STATUS_METHODS,
+  ...STRUCTURED_AGENT_SESSION_TURN_COMPLETION_METHODS,
+  ...STRUCTURED_AGENT_SESSION_THREAD_GOAL_METHODS,
+  ...STRUCTURED_AGENT_SESSION_CONVERSATION_OUTLINE_METHODS,
+  ...STRUCTURED_AGENT_SESSION_ITEM_METHODS,
+  ...STRUCTURED_AGENT_SESSION_CURRENT_REQUESTS_METHODS,
+  ...STRUCTURED_AGENT_SESSION_OPTIONS_READ_METHODS
 ]

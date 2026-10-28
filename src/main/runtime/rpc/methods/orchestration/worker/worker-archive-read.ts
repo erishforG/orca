@@ -19,12 +19,12 @@ import {
   decodeWorkerOutputCursor,
   encodeWorkerOutputCursor
 } from '../../../../orchestration/worker-output-cursor'
+import type { WorkerStructuredJournalArchive } from '../../../../orchestration/structured-worker-journal-archive'
+import { readArchivedStructuredJournal } from '../../orchestration-structured-worker-lifecycle'
 
 const ARCHIVED_TERMINAL_PAGE_LINES = 2_000
 
-// Serves the frozen output source after the live PTY is gone: a decoded transcript snapshot or
-// the stored redacted terminal tail. Cursors stay Dispatch-scoped and source-pinned exactly like
-// live reads.
+// Serve frozen transcript/redacted-tail output after PTY exit; preserve Dispatch-scoped, source-pinned cursors.
 export async function readArchivedWorkerOutput(args: {
   db: OrchestrationDb
   dispatchId: string
@@ -43,11 +43,29 @@ export async function readArchivedWorkerOutput(args: {
       `Dispatch ${args.dispatchId} was released without a preserved output archive.`
     )
   }
+  if (archive.kind === 'structured_journal') {
+    if (args.source === 'terminal') {
+      throw new OrchestrationError(
+        'archive_unavailable',
+        `Dispatch ${args.dispatchId} preserved transcript output only; terminal output was released.`
+      )
+    }
+    return readArchivedStructuredJournal({
+      dispatchId: args.dispatchId,
+      workerState: args.workerState,
+      resourceId: args.resource.id,
+      createdAt: archive.created_at,
+      releaseState: args.resource.release_state,
+      archive: JSON.parse(archive.content) as WorkerStructuredJournalArchive,
+      ...(args.cursor === undefined ? {} : { cursor: args.cursor }),
+      ...(args.limit === undefined ? {} : { limit: args.limit })
+    })
+  }
   if (archive.kind === 'transcript_pin') {
     if (args.source === 'terminal') {
       throw new OrchestrationError(
         'archive_unavailable',
-        `Dispatch ${args.dispatchId} preserved structured transcript output only; terminal output was released.`
+        `Dispatch ${args.dispatchId} preserved transcript output only; terminal output was released.`
       )
     }
     return readFrozenTranscript(
@@ -172,8 +190,7 @@ function archivedStatus(args: Parameters<typeof readArchivedWorkerOutput>[0]): {
   terminal: 'running' | 'exited' | 'unknown'
   liveness: PtyLivenessVerdict['status']
 } {
-  // A durable release is host-confirmed only after the close settles. Unknown and
-  // in-flight releases retain their archive, but must not manufacture an exit.
+  // Archive retention proves no exit; only a settled host-confirmed release does.
   const liveness =
     args.liveness ?? (args.resource.release_state === 'released' ? 'exited' : 'unverifiable')
   return {
