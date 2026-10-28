@@ -96,6 +96,8 @@ export function DictationController() {
     const modelId = settings?.voice?.sttModel
     if (!modelId) {
       toast('No speech model selected. Download one in Settings > Voice.', {
+        // Held keys and repeated presses replace this toast instead of stacking it.
+        id: 'dictation-no-model',
         action: {
           label: translate(
             'auto.components.dictation.DictationController.bb7f599ee7',
@@ -280,8 +282,6 @@ export function DictationController() {
     }
 
     const handleKeyDown = (): void => {
-      // Why: no early-return on a missing sttModel — startDictation() below is what
-      // owns the "No speech model selected" toast, so it must still get called.
       if (!settings?.voice?.enabled || dictationStateRef.current === 'stopping') {
         return
       }
@@ -294,17 +294,9 @@ export function DictationController() {
 
     const cleanup = window.api.ui.onDictationKeyDown(handleKeyDown)
     return cleanup
-  }, [
-    settings?.voice?.dictationMode,
-    settings?.voice?.enabled,
-    settings?.voice?.sttModel,
-    startDictation,
-    stopDictation
-  ])
+  }, [settings?.voice?.dictationMode, settings?.voice?.enabled, startDictation, stopDictation])
 
   useEffect(() => {
-    // Why: same as handleKeyDown above — don't gate on sttModel here, or
-    // startDictation()'s "No speech model selected" toast never gets a chance to fire.
     const canDictate = (): boolean => Boolean(settings?.voice?.enabled)
     const handleControl = (event: Event): void => {
       if (!canDictate() || dictationStateRef.current === 'stopping') {
@@ -331,7 +323,7 @@ export function DictationController() {
     }
     document.addEventListener(DICTATION_CONTROL_EVENT, handleControl)
     return () => document.removeEventListener(DICTATION_CONTROL_EVENT, handleControl)
-  }, [settings?.voice?.enabled, settings?.voice?.sttModel, startDictation, stopDictation])
+  }, [settings?.voice?.enabled, startDictation, stopDictation])
 
   useHoldDictationGesture({
     dictationStateRef,
